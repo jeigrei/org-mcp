@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { v4 as uuidv4 } from "uuid";
+import { randomUUID } from "node:crypto";
 import {
   parseOrgFile,
   buildHeadlineLine,
@@ -179,7 +179,7 @@ export class OrgStore {
         needsLeadingBlank = insertAt > 0;
       }
 
-      const id = uuidv4();
+      const id = randomUUID();
       const now = nowStamp();
       const scheduled = params.scheduled ? parseInputDate(params.scheduled) : null;
       const deadline = params.deadline ? parseInputDate(params.deadline) : null;
@@ -411,7 +411,7 @@ export class OrgStore {
 
     // Insert bottom-to-top so earlier entries' line offsets stay valid as we go.
     for (const entry of [...missing].sort((a, b) => b.headlineLine - a.headlineLine)) {
-      const id = uuidv4();
+      const id = randomUUID();
       if (entry.propertiesStart !== null) {
         lines.splice(entry.propertiesStart + 1, 0, `  :ID: ${id}`);
       } else {
