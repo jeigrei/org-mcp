@@ -53,13 +53,53 @@ Identity comes from one of two places:
 
 - **Cloudflare Access** (production): every request that passes an Access
   policy carries a `Cf-Access-Jwt-Assertion` header. org-mcp verifies that
-  JWT against your Zero Trust team's public keys and derives the user id
-  from the token's `common_name` (Service Tokens) or `email` (Access apps
-  using an IdP login) claim.
+  JWT against your Zero Trust team's public keys and reads the identity
+  from the token's `common_name` (Service Tokens) or `email` (interactive
+  logins, including Managed OAuth) claim.
 - **A raw `X-Org-User` header** (local dev only): used automatically when
   `CF_ACCESS_TEAM_DOMAIN`/`CF_ACCESS_AUD` aren't set. There's no
   verification at all in this mode — anyone who can reach the port can
   claim to be anyone. Only use it on `127.0.0.1`.
+
+### Identity mapping
+
+One person reaches org-mcp under *different claims depending on the client*.
+Claude Code authenticates with a Service Token, yielding its name
+(`grayson`); claude.ai authenticates interactively via Managed OAuth,
+yielding an email (`j.g.cupit@gmail.com`). Left alone those sanitize into two
+different directories, so the same human would see two different sets of
+tasks depending on which client they opened — which defeats the point of a
+shared memory layer.
+
+`ORG_MCP_IDENTITY_MAP` points at a JSON file mapping each raw claim to a
+canonical user id:
+
+```json
+{
+  "grayson": "grayson",
+  "j.g.cupit@gmail.com": "grayson",
+  "alice-laptop": "alice",
+  "alice@example.com": "alice"
+}
+```
+
+Lookups are case-insensitive and whitespace-tolerant. The mapping is
+deliberately explicit rather than inferred — deriving an id by stripping an
+email's domain would silently collapse `alice@gmail.com` and
+`alice@work.com`, two different people, into one directory.
+
+**When a map is configured, unmapped identities are rejected with a 403.**
+You're already minting a Service Token per person by hand, so adding a line
+here at the same time costs nothing, and a loud rejection beats silently
+creating an empty directory and having the LLM report you have no tasks. The
+map is read once at startup, so adding a user means restarting the process.
+
+With no map configured, behavior is unchanged: every distinct claim gets its
+own directory. That keeps local dev and single-identity setups zero-config.
+
+On startup the server logs the claims it loaded and the user ids they
+resolve to, and logs the resolved id each time a session opens — check those
+before pointing a second client at a user that already has data.
 
 ## Setup
 
@@ -91,6 +131,7 @@ change `HOST` to `0.0.0.0` unless you have another reason to trust your LAN.
 | `ORG_MCP_DEFAULT_FILE` | `inbox.org` | Default capture target filename, per user. |
 | `CF_ACCESS_TEAM_DOMAIN` | *(unset)* | Your Zero Trust team domain, e.g. `myteam.cloudflareaccess.com`. Required together with `CF_ACCESS_AUD` to enable real auth. |
 | `CF_ACCESS_AUD` | *(unset)* | The Access Application's Audience (AUD) tag. |
+| `ORG_MCP_IDENTITY_MAP` | *(unset)* | Path to a JSON file mapping Access claims to canonical user ids. See [Identity mapping](#identity-mapping). Unset means every claim gets its own directory. |
 
 Setting only one of `CF_ACCESS_TEAM_DOMAIN` / `CF_ACCESS_AUD` is a startup
 error — they're required together or not at all.
@@ -132,13 +173,82 @@ error — they're required together or not at all.
    ```
    How you configure that depends on the client — e.g. a `headers` field
    in the MCP server config for clients that support remote HTTP servers
-   with custom headers. Run `node dist/server.js` and start `cloudflared`
-   with `sudo systemctl enable --now cloudflared` (or equivalent) so both
-   survive a reboot.
+   with custom headers. See "Running under pm2" below for how to keep the
+   server itself alive across reboots; start `cloudflared` with
+   `sudo systemctl enable --now cloudflared` (or equivalent) so it survives
+   one too.
 
 Restart the server with `CF_ACCESS_TEAM_DOMAIN`/`CF_ACCESS_AUD` set once
 this is wired up — from then on every request must carry a valid,
 Cloudflare-signed identity.
+
+### Connecting clients
+
+Which clients can connect depends on how they authenticate, and the two
+mechanisms need different Access configuration on the same application.
+
+**Clients that can send static headers** (e.g. Claude Code) use the Service
+Tokens above directly:
+
+```bash
+claude mcp add --transport http org-mcp https://org.example.com/mcp \
+  --header "CF-Access-Client-Id: <client id>.access" \
+  --header "CF-Access-Client-Secret: <client secret>"
+```
+
+**Chat clients** (claude.ai, Claude Desktop, mobile) can't send custom
+headers — their custom-connector UI takes a URL and OAuth only. For those,
+turn on **[Access Managed OAuth](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/)**
+(Zero Trust → Access controls → Applications → your app → Edit → Advanced
+settings → Managed OAuth). That makes Access itself the OAuth 2.0
+authorization server: the client discovers it at
+`https://org.example.com/.well-known/oauth-authorization-server`, the user
+logs in through Access in a browser once, and Cloudflare resolves the
+resulting opaque token server-side and forwards the *same*
+`Cf-Access-Jwt-Assertion` header org-mcp already verifies. **No org-mcp code
+changes are required** — Cloudflare's only requirement for enabling it is
+that the origin validate that header, which this server does.
+
+Alongside it you'll want to:
+
+- Set **Allowed redirect URIs** to permit the chat client's callback.
+- Set **Access token lifetime** to 5–15 minutes and **Grant session
+  duration** to 1–2 weeks. Cloudflare recommends this pairing for agent
+  clients: tokens refresh silently in the background, policies are
+  re-evaluated on each refresh, and the user only re-authenticates every
+  couple of weeks.
+- Add an **interactive** rule (One-Time PIN or an IdP) to the application's
+  policy. A Service Auth rule can't satisfy a browser login, so it can't
+  carry the OAuth leg — you want both rules on the app, Service Auth for
+  header-based clients and an interactive one for chat clients.
+
+Since the two paths yield different identity claims for the same person, set
+up [Identity mapping](#identity-mapping) before connecting the second client.
+
+### Running under pm2
+
+On a box that already runs other services under pm2 (e.g. alongside
+MagicMirror), start org-mcp the same way rather than introducing a second
+process manager or an ecosystem file:
+
+```bash
+export CF_ACCESS_TEAM_DOMAIN=myteam.cloudflareaccess.com
+export CF_ACCESS_AUD=<access-app-audience-tag>
+pm2 start npm --name org-mcp --cwd ~/org-mcp -- start
+pm2 save
+```
+
+`pm2 save` snapshots the resolved environment (including the two exported
+vars above) into `~/.pm2/dump.pm2`, so `pm2 resurrect` — run automatically
+by the `pm2-<user>` systemd service set up via `pm2 startup` — brings it
+back with the same config after a reboot. No separate `.env` file or
+ecosystem config needed.
+
+After changing code, redeploy with:
+
+```bash
+git pull && npm install && npm run build && pm2 restart org-mcp
+```
 
 ## Local development (no Cloudflare)
 

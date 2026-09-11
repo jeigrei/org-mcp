@@ -8,13 +8,14 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { OrgStore, OrgError } from "./store.js";
-import { createAccessVerifier, sanitizeUserId, type AccessIdentity } from "./cfAccess.js";
+import { createAccessVerifier } from "./cfAccess.js";
+import { IdentityResolver, IdentityError, type ResolvedIdentity } from "./identity.js";
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
-      orgUser?: AccessIdentity;
+      orgUser?: ResolvedIdentity;
     }
   }
 }
@@ -27,6 +28,7 @@ const BASE_DIR = process.env.ORG_MCP_DIR
 const DEFAULT_FILE = process.env.ORG_MCP_DEFAULT_FILE || "inbox.org";
 const CF_ACCESS_TEAM_DOMAIN = process.env.CF_ACCESS_TEAM_DOMAIN;
 const CF_ACCESS_AUD = process.env.CF_ACCESS_AUD;
+const IDENTITY_MAP_PATH = process.env.ORG_MCP_IDENTITY_MAP;
 
 if ((CF_ACCESS_TEAM_DOMAIN && !CF_ACCESS_AUD) || (!CF_ACCESS_TEAM_DOMAIN && CF_ACCESS_AUD)) {
   console.error(
@@ -56,30 +58,45 @@ if (!accessVerifier) {
   }
 }
 
+const identityResolver = await IdentityResolver.load(IDENTITY_MAP_PATH).catch((err) => {
+  console.error(`org-mcp: ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+});
+
+if (identityResolver.isStrict && identityResolver.size === 0) {
+  console.warn(
+    `org-mcp: WARNING — identity map "${IDENTITY_MAP_PATH}" is empty, so every identity will be ` +
+      "rejected. Add entries mapping each Access claim to a user id."
+  );
+}
+
 // --- Auth middleware: resolves req.orgUser from Cloudflare Access, or a dev-mode header. ---
 
 async function authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
-  if (!accessVerifier) {
-    const devUser = (req.header("x-org-user") || "default").toString();
-    try {
-      req.orgUser = { id: sanitizeUserId(devUser), label: devUser };
-      next();
-    } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  let label: string;
+
+  if (accessVerifier) {
+    const token = req.header("cf-access-jwt-assertion");
+    if (!token) {
+      res.status(401).json({ error: "Missing Cf-Access-Jwt-Assertion header (request did not come through Cloudflare Access)." });
+      return;
     }
-    return;
+    try {
+      label = (await accessVerifier(token)).label;
+    } catch (err) {
+      res.status(401).json({ error: `Invalid Cloudflare Access token: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+  } else {
+    label = (req.header("x-org-user") || "default").toString();
   }
 
-  const token = req.header("cf-access-jwt-assertion");
-  if (!token) {
-    res.status(401).json({ error: "Missing Cf-Access-Jwt-Assertion header (request did not come through Cloudflare Access)." });
-    return;
-  }
   try {
-    req.orgUser = await accessVerifier(token);
+    req.orgUser = { id: identityResolver.resolve(label), label };
     next();
   } catch (err) {
-    res.status(401).json({ error: `Invalid Cloudflare Access token: ${err instanceof Error ? err.message : String(err)}` });
+    const status = err instanceof IdentityError ? 403 : 400;
+    res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
   }
 }
 
@@ -498,6 +515,13 @@ const httpServer = app.listen(PORT, HOST, () => {
     accessVerifier
       ? `org-mcp: Cloudflare Access verification enabled for team "${CF_ACCESS_TEAM_DOMAIN}"`
       : `org-mcp: Cloudflare Access verification DISABLED (dev mode)`
+  );
+  console.error(
+    identityResolver.isStrict
+      ? `org-mcp: identity map loaded from ${IDENTITY_MAP_PATH} — ${identityResolver.size} claim(s) ` +
+          `mapping to user(s): ${identityResolver.userIds.join(", ")}. Unmapped identities are rejected.`
+      : `org-mcp: no identity map configured (ORG_MCP_IDENTITY_MAP) — each distinct Access identity ` +
+          `gets its own directory.`
   );
 });
 

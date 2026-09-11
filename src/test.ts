@@ -2,9 +2,101 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { OrgStore } from "./store.js";
+import { IdentityResolver, IdentityError, sanitizeUserId } from "./identity.js";
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`ASSERTION FAILED: ${msg}`);
+}
+
+async function testIdentityMapping(dir: string) {
+  console.log("\n=== identity mapping ===");
+
+  assert(sanitizeUserId("Alice") === "alice", "sanitize lowercases");
+  assert(sanitizeUserId("alice@gmail.com") === "alice_gmail.com", "sanitize rewrites @");
+  assert(sanitizeUserId("  spaced name  ") === "spaced_name", "sanitize trims and joins");
+  let threw = false;
+  try {
+    sanitizeUserId("!!!");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "sanitize rejects an identity with nothing usable in it");
+
+  // With no map configured, behavior is unchanged: each claim gets its own directory.
+  const permissive = await IdentityResolver.load(undefined);
+  assert(!permissive.isStrict, "no map means non-strict");
+  assert(permissive.resolve("alice") === "alice", "unmapped claim passes through");
+  assert(
+    permissive.resolve("alice@gmail.com") === "alice_gmail.com",
+    "without a map, the same human's two claims split into two ids (the bug the map fixes)"
+  );
+
+  const mapPath = path.join(dir, "identities.json");
+  await fs.writeFile(
+    mapPath,
+    JSON.stringify({
+      grayson: "grayson",
+      "j.g.cupit@gmail.com": "grayson",
+      "Alice-Laptop": "alice",
+      "alice@example.com": "alice",
+    }),
+    "utf8"
+  );
+  const strict = await IdentityResolver.load(mapPath);
+
+  assert(strict.isStrict, "configured map means strict");
+  assert(strict.size === 4, `expected 4 claims, got ${strict.size}`);
+  assert(
+    strict.resolve("grayson") === strict.resolve("j.g.cupit@gmail.com"),
+    "service token and email claims converge on one id"
+  );
+  assert(strict.resolve("grayson") === "grayson", "canonical id is the mapped value");
+  assert(strict.resolve("alice@example.com") === "alice", "second user maps independently");
+  assert(strict.resolve("ALICE-LAPTOP") === "alice", "lookup is case-insensitive");
+  assert(strict.resolve("  alice@example.com ") === "alice", "lookup tolerates whitespace");
+  assert(
+    JSON.stringify(strict.userIds) === JSON.stringify(["alice", "grayson"]),
+    `expected deduped user ids, got ${JSON.stringify(strict.userIds)}`
+  );
+
+  let rejected = false;
+  try {
+    strict.resolve("mallory@evil.com");
+  } catch (err) {
+    rejected = err instanceof IdentityError;
+  }
+  assert(rejected, "unmapped identity is rejected with IdentityError, not given a directory");
+
+  // Malformed maps must fail loudly at load, not at request time.
+  const badPath = path.join(dir, "bad.json");
+  await fs.writeFile(badPath, "{ not json", "utf8");
+  let loadFailed = false;
+  try {
+    await IdentityResolver.load(badPath);
+  } catch {
+    loadFailed = true;
+  }
+  assert(loadFailed, "invalid JSON fails at load");
+
+  const arrayPath = path.join(dir, "array.json");
+  await fs.writeFile(arrayPath, '["alice"]', "utf8");
+  loadFailed = false;
+  try {
+    await IdentityResolver.load(arrayPath);
+  } catch {
+    loadFailed = true;
+  }
+  assert(loadFailed, "a non-object map fails at load");
+
+  loadFailed = false;
+  try {
+    await IdentityResolver.load(path.join(dir, "does-not-exist.json"));
+  } catch {
+    loadFailed = true;
+  }
+  assert(loadFailed, "a missing map file fails at load");
+
+  console.log("identity mapping OK");
 }
 
 async function main() {
@@ -151,6 +243,8 @@ async function main() {
   for (const leaky of ["startLine", "endLine", "headlineLine", "planningLine", "scheduledRaw"]) {
     assert(!cleanKeys.includes(leaky), `CleanEntry must not expose internal field "${leaky}"`);
   }
+
+  await testIdentityMapping(dir);
 
   console.log("\nALL TESTS PASSED");
   await fs.rm(dir, { recursive: true, force: true });
