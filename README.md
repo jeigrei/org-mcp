@@ -244,11 +244,31 @@ by the `pm2-<user>` systemd service set up via `pm2 startup` — brings it
 back with the same config after a reboot. No separate `.env` file or
 ecosystem config needed.
 
-After changing code, redeploy with:
+### Redeploying
+
+`deploy.sh` pulls, installs, builds, runs the tests, and restarts the pm2
+process — aborting before the restart if any step fails, so a broken build
+never replaces a working one. Run it from your own machine in one shot:
 
 ```bash
-git pull && npm install && npm run build && pm2 restart org-mcp
+ssh pi 'cd ~/org-mcp && ./deploy.sh'
 ```
+
+Worth aliasing, since that's the whole deploy. It pulls from `origin`, so
+push your commits to GitHub first — otherwise it'll cheerfully redeploy the
+code that's already running.
+
+Two things it deliberately refuses to do:
+
+- **Deploy over uncommitted changes.** If the working tree on the Pi has
+  modifications, it stops rather than pulling over them. Commit, stash, or
+  discard them there first.
+- **Refresh the process environment.** `pm2 restart` runs without
+  `--update-env`, so the `CF_ACCESS_*` vars the process was started with
+  survive the restart. Passing `--update-env` from a plain SSH session would
+  replace them with that shell's empty environment and silently drop Access
+  authentication. If you do need to change those vars, restart it by hand
+  with them exported and re-run `pm2 save`.
 
 ## Local development (no Cloudflare)
 
