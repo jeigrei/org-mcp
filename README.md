@@ -258,6 +258,12 @@ Worth aliasing, since that's the whole deploy. It pulls from `origin`, so
 push your commits to GitHub first — otherwise it'll cheerfully redeploy the
 code that's already running.
 
+The script sources `nvm` itself before doing anything. `ssh host 'cmd'` runs a
+non-interactive shell, which returns early from `~/.bashrc` before nvm's setup
+— so `node`, `npm`, and `pm2` are all off `PATH` even though they work fine in
+an interactive session. If node is installed some other way on your box, the
+script says which command it couldn't find and where to add it.
+
 Two things it deliberately refuses to do:
 
 - **Deploy over uncommitted changes.** If the working tree on the Pi has

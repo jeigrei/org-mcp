@@ -6,6 +6,26 @@ set -euo pipefail
 APP_NAME=org-mcp
 cd "$(dirname "$0")"
 
+# `ssh host './deploy.sh'` runs a non-interactive shell, which returns early from
+# ~/.bashrc before nvm's setup — leaving node, npm, and pm2 (a global npm package)
+# off PATH. Load nvm here so the script works the same however it's invoked.
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+if [ -s "$NVM_DIR/nvm.sh" ]; then
+  set +eu
+  # shellcheck disable=SC1091
+  . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true
+  set -eu
+fi
+
+for cmd in node npm pm2; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "'$cmd' is not on PATH in a non-interactive shell." >&2
+    echo "Check where it lives with: ssh <host> 'bash -lc \"command -v $cmd\"'" >&2
+    echo "then add that directory to PATH at the top of this script." >&2
+    exit 1
+  fi
+done
+
 if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "Refusing to deploy: uncommitted changes in $(pwd)." >&2
   echo "Commit, stash, or discard them first ('git status' to see what's there)." >&2
