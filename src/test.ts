@@ -8,6 +8,119 @@ function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`ASSERTION FAILED: ${msg}`);
 }
 
+async function testOrganizeTools(baseDir: string) {
+  console.log("\n=== refile / tags / edit ===");
+  const dir = path.join(baseDir, "organize");
+  const store = new OrgStore(dir);
+  await store.init();
+
+  // --- refile a leaf under a parent in the same file ---
+  const project = await store.capture({ headline: "Kitchen renovation" });
+  const task = await store.capture({ headline: "Get quote", todo: "TODO" });
+  const moved = await store.refile(task.id!, { parentId: project.id! });
+  assert(moved.level === 2, `expected level 2, got ${moved.level}`);
+  assert(moved.file === "inbox.org", "stayed in the same file");
+  assert((await store.getEntry(task.id!))!.headline === "Get quote", "still reachable by id");
+
+  // --- refile a parent WITH children: the whole subtree must shift ---
+  const area = await store.capture({ headline: "Home" });
+  await store.refile(project.id!, { parentId: area.id! });
+  const projectAfter = (await store.getEntry(project.id!))!;
+  const taskAfter = (await store.getEntry(task.id!))!;
+  assert(projectAfter.level === 2, `project should be level 2, got ${projectAfter.level}`);
+  assert(
+    taskAfter.level === 3,
+    `child should have shifted to level 3, got ${taskAfter.level} (subtree was flattened)`
+  );
+  console.log("inbox.org after nesting:\n" + (await store.readFile("inbox.org")));
+
+  // --- cycle guard ---
+  let cycleRejected = false;
+  try {
+    await store.refile(area.id!, { parentId: taskAfter.id! });
+  } catch {
+    cycleRejected = true;
+  }
+  assert(cycleRejected, "refiling an entry under its own descendant must be rejected");
+
+  // --- refile across files, carrying children along ---
+  await store.refile(project.id!, { file: "home.org" });
+  const projectMoved = (await store.getEntry(project.id!))!;
+  const taskMoved = (await store.getEntry(task.id!))!;
+  assert(projectMoved.file === "home.org", `expected home.org, got ${projectMoved.file}`);
+  assert(projectMoved.level === 1, "top level in the destination file");
+  assert(taskMoved.file === "home.org", "child came along to the new file");
+  assert(taskMoved.level === 2, `child re-leveled under its parent, got ${taskMoved.level}`);
+  const inboxAfter = await store.readFile("inbox.org");
+  assert(!inboxAfter.includes("Kitchen renovation"), "entry left the source file");
+  assert(!/\n\n\n/.test(inboxAfter), "no stray blank-line pileup in the source file");
+
+  // --- tags ---
+  await store.setTags(task.id!, ["home", "errand"]);
+  assert(
+    JSON.stringify((await store.getEntry(task.id!))!.tags) === JSON.stringify(["home", "errand"]),
+    "tags set"
+  );
+  await store.updateState(task.id!, "DONE");
+  assert(
+    (await store.getEntry(task.id!))!.tags.length === 2,
+    "tags survive a headline rebuild from updateState"
+  );
+  await store.setTags(task.id!, ["home"]);
+  assert((await store.getEntry(task.id!))!.tags.length === 1, "tags replaced, not merged");
+  await store.setTags(task.id!, []);
+  assert((await store.getEntry(task.id!))!.tags.length === 0, "tags cleared");
+
+  await store.setTags(project.id!, ["home", "reno"]);
+  await store.setTags(area.id!, ["home"]);
+  const tags = await store.listTags();
+  const home = tags.find((t) => t.tag === "home");
+  assert(home?.count === 2, `expected home used twice, got ${JSON.stringify(tags)}`);
+  assert(tags.some((t) => t.tag === "reno"), "reno counted");
+  console.log("tag inventory:", tags);
+
+  // --- editEntry ---
+  const scheduled = await store.capture({
+    headline: "call contractor",
+    todo: "TODO",
+    priority: "C",
+    tags: ["home"],
+    scheduled: "2026-10-01",
+    body: "original body",
+  });
+  const renamed = await store.editEntry(scheduled.id!, {
+    headline: "Get bathroom quote from Sarah",
+  });
+  assert(renamed.headline === "Get bathroom quote from Sarah", "headline changed");
+  assert(renamed.id === scheduled.id, "id is stable across a rename");
+  assert(renamed.todo === "TODO", "todo keyword preserved");
+  assert(renamed.priority === "C", "priority preserved");
+  assert(renamed.tags.includes("home"), "tags preserved");
+  assert(renamed.scheduled?.date === "2026-10-01", "SCHEDULED preserved");
+  assert(renamed.body.includes("original body"), "body untouched when not passed");
+
+  const reprioritized = await store.editEntry(scheduled.id!, { priority: "A" });
+  assert(reprioritized.priority === "A", "priority changed");
+  const unprioritized = await store.editEntry(scheduled.id!, { priority: null });
+  assert(unprioritized.priority === null, "priority cleared");
+
+  const rebodied = await store.editEntry(scheduled.id!, { body: "new body\nsecond line" });
+  assert(rebodied.body.includes("second line"), "body replaced");
+  assert(!rebodied.body.includes("original body"), "old body gone");
+  const debodied = await store.editEntry(scheduled.id!, { body: null });
+  assert(debodied.body.trim() === "", "body cleared");
+
+  // --- editing a parent's body must not eat its children ---
+  const withKids = (await store.getEntry(project.id!))!;
+  await store.editEntry(withKids.id!, { body: "project context goes here" });
+  const kidStillThere = await store.getEntry(task.id!);
+  assert(kidStillThere !== null, "child survived the parent's body edit");
+  assert(kidStillThere!.level === 2, "child kept its level");
+  console.log("home.org after body edit:\n" + (await store.readFile("home.org")));
+
+  console.log("refile / tags / edit OK");
+}
+
 async function testIdentityMapping(dir: string) {
   console.log("\n=== identity mapping ===");
 
@@ -244,6 +357,7 @@ async function main() {
     assert(!cleanKeys.includes(leaky), `CleanEntry must not expose internal field "${leaky}"`);
   }
 
+  await testOrganizeTools(dir);
   await testIdentityMapping(dir);
 
   console.log("\nALL TESTS PASSED");

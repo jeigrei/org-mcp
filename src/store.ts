@@ -22,6 +22,42 @@ export class OrgError extends Error {}
 
 const FILENAME_RE = /^[\w.-]+\.org$/;
 
+/** Strips characters org can't carry in a tag, and drops anything left empty. */
+function sanitizeTags(tags: readonly string[] | undefined): string[] {
+  return (tags ?? []).map((t) => t.replace(/[^\w@%#]/g, "")).filter(Boolean);
+}
+
+/**
+ * Removes lines [start, end) and collapses the blank line the removal would otherwise
+ * strand between two entries.
+ */
+function spliceSubtree(lines: string[], start: number, end: number): string[] {
+  const removed = lines.slice(start, end);
+  lines.splice(start, end - start);
+  if (start === 0) {
+    while (lines.length > 0 && lines[0].trim() === "") lines.shift();
+  } else {
+    while (
+      start < lines.length &&
+      lines[start]?.trim() === "" &&
+      lines[start - 1]?.trim() === ""
+    ) {
+      lines.splice(start, 1);
+    }
+  }
+  return removed;
+}
+
+/** Rewrites the leading stars of every headline in `subtree` by `delta` levels. */
+function shiftSubtreeLevels(subtree: string[], delta: number): string[] {
+  if (delta === 0) return subtree;
+  return subtree.map((line) => {
+    const m = line.match(/^(\*+)(\s.*)$/);
+    if (!m) return line;
+    return "*".repeat(m[1].length + delta) + m[2];
+  });
+}
+
 function priorityRank(p: "A" | "B" | "C" | null): number {
   if (p === "A") return 0;
   if (p === "B") return 1;
@@ -105,6 +141,17 @@ export class OrgStore {
     }
   }
 
+  /**
+   * Locks several files at once. Always acquires in sorted order so that two operations
+   * moving entries in opposite directions (a.org→b.org and b.org→a.org) can't deadlock.
+   */
+  private async withFileLocks<T>(filenames: string[], fn: () => Promise<T>): Promise<T> {
+    const ordered = [...new Set(filenames)].sort();
+    const acquire = (i: number): Promise<T> =>
+      i >= ordered.length ? fn() : this.withFileLock(ordered[i], () => acquire(i + 1));
+    return acquire(0);
+  }
+
   private async readLines(filename: string): Promise<string[]> {
     const p = this.resolvePath(filename);
     try {
@@ -183,9 +230,7 @@ export class OrgStore {
       const now = nowStamp();
       const scheduled = params.scheduled ? parseInputDate(params.scheduled) : null;
       const deadline = params.deadline ? parseInputDate(params.deadline) : null;
-      const tags = (params.tags ?? [])
-        .map((t) => t.replace(/[^\w@%#]/g, ""))
-        .filter(Boolean);
+      const tags = sanitizeTags(params.tags);
 
       const entryLines: string[] = [];
       entryLines.push(
@@ -362,38 +407,212 @@ export class OrgStore {
     const { filename } = found;
     const archiveFile = this.archiveFileFor(filename);
 
-    return this.withFileLock(filename, async () => {
+    return this.withFileLocks([filename, archiveFile], async () => {
       const lines = await this.readLines(filename);
       const entries = parseOrgFile(lines.join("\n"), filename);
       const entry = entries.find((e) => e.id === id);
       if (!entry) throw new OrgError(`No entry found with id "${id}".`);
 
-      const subtreeLines = lines.slice(entry.startLine, entry.endLine);
-      lines.splice(entry.startLine, entry.endLine - entry.startLine);
-      // Clean up a stray blank line left at the removal point.
-      if (entry.startLine === 0) {
-        while (lines.length > 0 && lines[0].trim() === "") lines.shift();
-      } else {
-        while (
-          entry.startLine < lines.length &&
-          lines[entry.startLine]?.trim() === "" &&
-          lines[entry.startLine - 1]?.trim() === ""
-        ) {
-          lines.splice(entry.startLine, 1);
-        }
-      }
+      const subtreeLines = spliceSubtree(lines, entry.startLine, entry.endLine);
+
+      // Write the archive first: if the second write fails the subtree exists twice,
+      // which is visible and recoverable, rather than not at all.
+      const archiveLines = await this.readLines(archiveFile);
+      const needsBlank = archiveLines.some((l) => l.trim() !== "");
+      archiveLines.push(...(needsBlank ? ["", ...subtreeLines] : subtreeLines));
+      await this.writeLines(archiveFile, archiveLines);
+
       await this.writeLines(filename, lines);
 
-      await this.withFileLock(archiveFile, async () => {
-        const archiveLines = await this.readLines(archiveFile);
-        const insertAt = archiveLines.length;
-        const needsBlank = archiveLines.some((l) => l.trim() !== "");
-        const toAppend = needsBlank ? ["", ...subtreeLines] : subtreeLines;
-        archiveLines.splice(insertAt, 0, ...toAppend);
-        await this.writeLines(archiveFile, archiveLines);
-      });
-
       return { id, archivedTo: archiveFile };
+    });
+  }
+
+  /**
+   * Moves an entry and its subtree under a new parent and/or into another file —
+   * the "organize the inbox later" half of capture-fast-file-later.
+   */
+  async refile(
+    id: string,
+    target: { parentId?: string | null; file?: string | null }
+  ): Promise<CleanEntry> {
+    const parentId = target.parentId ?? null;
+    let destFile = target.file ?? null;
+    if (!parentId && !destFile) {
+      throw new OrgError("refile needs a parent_id, a file, or both.");
+    }
+    if (destFile && !destFile.endsWith(".org")) destFile += ".org";
+
+    const found = await this.findEntryById(id);
+    if (!found) throw new OrgError(`No entry found with id "${id}".`);
+    const sourceFile = found.filename;
+
+    if (parentId) {
+      const parentFound = await this.findEntryById(parentId);
+      if (!parentFound) throw new OrgError(`No entry found with id "${parentId}".`);
+      if (destFile && destFile !== parentFound.filename) {
+        throw new OrgError(
+          `Parent "${parentId}" lives in ${parentFound.filename}, not ${destFile}. ` +
+            "Omit file to refile into the parent's own file."
+        );
+      }
+      destFile = parentFound.filename;
+    }
+    const destinationFile = destFile!;
+
+    return this.withFileLocks([sourceFile, destinationFile], async () => {
+      const sourceLines = await this.readLines(sourceFile);
+      const entry = parseOrgFile(sourceLines.join("\n"), sourceFile).find((e) => e.id === id);
+      if (!entry) throw new OrgError(`No entry found with id "${id}".`);
+
+      if (parentId) {
+        const parentBefore = parseOrgFile(sourceLines.join("\n"), sourceFile).find(
+          (e) => e.id === parentId
+        );
+        if (
+          sourceFile === destinationFile &&
+          parentBefore &&
+          parentBefore.headlineLine >= entry.startLine &&
+          parentBefore.headlineLine < entry.endLine
+        ) {
+          throw new OrgError("Cannot refile an entry into its own subtree.");
+        }
+      }
+
+      const subtree = spliceSubtree(sourceLines, entry.startLine, entry.endLine);
+
+      // Re-parse after the removal so destination offsets reflect the shifted file.
+      const destLines =
+        sourceFile === destinationFile ? sourceLines : await this.readLines(destinationFile);
+      const destEntries = parseOrgFile(destLines.join("\n"), destinationFile);
+
+      let newLevel = 1;
+      let insertAt = destLines.length;
+      let needsLeadingBlank: boolean;
+
+      if (parentId) {
+        const parent = destEntries.find((e) => e.id === parentId);
+        if (!parent) throw new OrgError(`No entry found with id "${parentId}".`);
+        newLevel = parent.level + 1;
+        insertAt = parent.endLine;
+        needsLeadingBlank = false;
+      } else {
+        while (insertAt > 0 && destLines[insertAt - 1].trim() === "") insertAt--;
+        needsLeadingBlank = insertAt > 0;
+      }
+
+      // Guard on the shallowest headline in the subtree, not just its root: a malformed
+      // file can leave a shallower headline inside the span parseOrgFile returns.
+      const levels = subtree
+        .map((l) => l.match(/^(\*+)\s/))
+        .filter((m): m is RegExpMatchArray => m !== null)
+        .map((m) => m[1].length);
+      const shallowest = Math.min(...levels);
+      const delta = newLevel - entry.level;
+      if (shallowest + delta < 1) {
+        throw new OrgError("Refiling there would push part of the subtree above level 1.");
+      }
+
+      const shifted = shiftSubtreeLevels(subtree, delta);
+      destLines.splice(insertAt, 0, ...(needsLeadingBlank ? ["", ...shifted] : shifted));
+
+      if (sourceFile === destinationFile) {
+        await this.writeLines(destinationFile, destLines);
+      } else {
+        await this.writeLines(destinationFile, destLines);
+        await this.writeLines(sourceFile, sourceLines);
+      }
+
+      const moved = parseOrgFile(
+        (await this.readLines(destinationFile)).join("\n"),
+        destinationFile
+      ).find((e) => e.id === id);
+      if (!moved) throw new OrgError(`Entry "${id}" went missing during refile.`);
+      return cleanEntry(moved);
+    });
+  }
+
+  /** Replaces an entry's tags outright. */
+  async setTags(id: string, tags: string[]): Promise<CleanEntry> {
+    const found = await this.findEntryById(id);
+    if (!found) throw new OrgError(`No entry found with id "${id}".`);
+    const { filename } = found;
+
+    return this.withFileLock(filename, async () => {
+      const lines = await this.readLines(filename);
+      const entry = parseOrgFile(lines.join("\n"), filename).find((e) => e.id === id);
+      if (!entry) throw new OrgError(`No entry found with id "${id}".`);
+
+      lines[entry.headlineLine] = buildHeadlineLine(
+        entry.level,
+        entry.todo,
+        entry.priority,
+        entry.headline,
+        sanitizeTags(tags)
+      );
+      await this.writeLines(filename, lines);
+      return cleanEntry(parseOrgFile(lines.join("\n"), filename).find((e) => e.id === id)!);
+    });
+  }
+
+  /** Every tag in use, with how many entries carry it. */
+  async listTags(): Promise<{ tag: string; count: number }[]> {
+    const counts = new Map<string, number>();
+    for (const entry of await this.allEntries()) {
+      for (const tag of entry.tags) {
+        counts.set(tag, (counts.get(tag) ?? 0) + 1);
+      }
+    }
+    return [...counts.entries()]
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
+  }
+
+  /**
+   * Reworks an entry's text. Omitting a field leaves it unchanged; passing null clears
+   * it (where clearing makes sense).
+   */
+  async editEntry(
+    id: string,
+    updates: { headline?: string; body?: string | null; priority?: "A" | "B" | "C" | null }
+  ): Promise<CleanEntry> {
+    if (updates.headline === undefined && updates.body === undefined && updates.priority === undefined) {
+      throw new OrgError("editEntry needs at least one of headline, body, or priority.");
+    }
+    if (updates.headline !== undefined && !updates.headline.trim()) {
+      throw new OrgError("headline cannot be empty.");
+    }
+
+    const found = await this.findEntryById(id);
+    if (!found) throw new OrgError(`No entry found with id "${id}".`);
+    const { filename } = found;
+
+    return this.withFileLock(filename, async () => {
+      const lines = await this.readLines(filename);
+      const entry = parseOrgFile(lines.join("\n"), filename).find((e) => e.id === id);
+      if (!entry) throw new OrgError(`No entry found with id "${id}".`);
+
+      if (updates.headline !== undefined || updates.priority !== undefined) {
+        lines[entry.headlineLine] = buildHeadlineLine(
+          entry.level,
+          entry.todo,
+          updates.priority === undefined ? entry.priority : updates.priority,
+          updates.headline === undefined ? entry.headline : updates.headline.trim(),
+          entry.tags
+        );
+      }
+
+      if (updates.body !== undefined) {
+        // bodyEnd stops before the first child headline, so a parent keeps its children.
+        const replacement =
+          updates.body && updates.body.trim()
+            ? updates.body.replace(/\r\n/g, "\n").split("\n")
+            : [];
+        lines.splice(entry.bodyStart, entry.bodyEnd - entry.bodyStart, ...replacement);
+      }
+
+      await this.writeLines(filename, lines);
+      return cleanEntry(parseOrgFile(lines.join("\n"), filename).find((e) => e.id === id)!);
     });
   }
 

@@ -146,7 +146,12 @@ function buildServer(store: OrgStore): McpServer {
       description:
         `Append a new entry (headline) to a local org file, org-capture style. ` +
         `Use this to jot down tasks, notes, or events. Defaults to file "${DEFAULT_FILE}" if none given. ` +
-        `Pass parent_id to nest the new entry under an existing entry instead of appending at top level.`,
+        `Pass parent_id to nest the new entry under an existing entry instead of appending at top level. ` +
+        `Capturing flat and fast is fine — don't stall to work out where something belongs, since ` +
+        `entries can be filed under a project later with org_refile. Not everything should be a TODO: ` +
+        `omit the todo keyword for standing context and reference notes, which is what makes this ` +
+        `useful as a memory layer rather than just a task list. When tagging, call org_list_tags ` +
+        `first and reuse an existing tag instead of coining a near-synonym.`,
       inputSchema: {
         headline: z.string().describe("The entry title (no stars, state, or tags)."),
         file: z
@@ -338,6 +343,114 @@ function buildServer(store: OrgStore): McpServer {
       try {
         const entry = await store.addNote(args.id, args.note);
         return ok(entry);
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "org_refile",
+    {
+      title: "Move an entry",
+      description:
+        "Move an entry, and everything nested under it, to a new home — this is how you organize " +
+        "an inbox after the fact. Pass parent_id to make it the last child of that entry, or file " +
+        "to move it to the top level of another file. Levels are adjusted automatically, so a " +
+        "whole project moves with its tasks intact.",
+      inputSchema: {
+        id: z.string().describe("The entry's id."),
+        parent_id: z
+          .string()
+          .nullish()
+          .describe("Id of the entry it should become a child of."),
+        file: z
+          .string()
+          .nullish()
+          .describe("Destination filename, to move it to that file's top level. Must match the parent's file if both are given."),
+      },
+    },
+    async (args) => {
+      try {
+        const entry = await store.refile(args.id, {
+          parentId: args.parent_id,
+          file: args.file,
+        });
+        return ok(entry);
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "org_edit_entry",
+    {
+      title: "Edit an entry's text",
+      description:
+        "Rework an entry captured in a hurry: change its headline, replace its body, or set its " +
+        "priority. Omit a field to leave it unchanged; pass null to clear it. The entry keeps its " +
+        "id, so anything referring to it stays valid. Use org_add_note instead to append to a " +
+        "body without replacing it, and org_update_state to change TODO state.",
+      inputSchema: {
+        id: z.string().describe("The entry's id."),
+        headline: z.string().optional().describe("New title text (no stars, state, or tags)."),
+        body: z
+          .string()
+          .nullish()
+          .describe("Replacement body text, or null to clear it. Children are left untouched."),
+        priority: z.enum(["A", "B", "C"]).nullish().describe("New priority, or null to clear it."),
+      },
+    },
+    async (args) => {
+      try {
+        const entry = await store.editEntry(args.id, {
+          headline: args.headline,
+          body: args.body,
+          priority: args.priority,
+        });
+        return ok(entry);
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "org_set_tags",
+    {
+      title: "Set an entry's tags",
+      description:
+        "Replace an entry's tags with exactly this list (pass an empty list to clear them). " +
+        "Call org_list_tags first and reuse tags that already exist — inventing a near-synonym " +
+        "for a tag already in use (:work: vs :job:) quietly breaks tag-filtered searches later.",
+      inputSchema: {
+        id: z.string().describe("The entry's id."),
+        tags: z.array(z.string()).describe("The complete tag list, without colons."),
+      },
+    },
+    async (args) => {
+      try {
+        const entry = await store.setTags(args.id, args.tags);
+        return ok(entry);
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "org_list_tags",
+    {
+      title: "List tags in use",
+      description:
+        "List every tag currently in use with how many entries carry it. Check this before " +
+        "tagging anything so you reuse the existing vocabulary instead of inventing synonyms.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        return ok(await store.listTags());
       } catch (err) {
         return fail(err);
       }

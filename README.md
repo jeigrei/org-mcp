@@ -308,9 +308,33 @@ curl -s http://127.0.0.1:3000/mcp \
 | `org_update_state` | Change an entry's TODO keyword (e.g. mark DONE); stamps/clears `CLOSED`. |
 | `org_schedule` | Set/change/clear `SCHEDULED` and/or `DEADLINE`. |
 | `org_add_note` | Append a timestamped note to an entry's body. |
+| `org_refile` | Move an entry and its subtree under another entry or into another file. |
+| `org_edit_entry` | Change an entry's headline, body, or priority. |
+| `org_set_tags` | Replace an entry's tags. |
+| `org_list_tags` | List every tag in use, with counts. |
 | `org_archive_entry` | Move an entry's subtree to `<file>_archive.org`. |
 | `org_read_file` | Read the raw text of one tracked org file. |
 | `org_list_files` | List tracked org files (for the requesting user). |
+
+### Capture fast, organize later
+
+The tools are built around org's two-phase habit rather than forcing structure
+at capture time. During a brain dump, `org_capture` everything flat into the
+inbox — no deciding where things belong mid-thought. Later, an "organize my
+inbox" pass uses `org_refile` to cluster entries under project headlines,
+`org_set_tags` to apply a consistent vocabulary, and `org_edit_entry` to
+rework anything captured in a hurry. Refiling carries a whole subtree and
+re-levels it, so a project moves with its tasks intact.
+
+`org_list_tags` exists to stop tag drift. Across many sessions and several
+clients, an LLM with no view of the existing vocabulary will invent `:work:`,
+then `:job:`, then `:career:` for one concept, and tag-filtered searches
+quietly stop finding things. The tool descriptions tell it to check first.
+
+A corollary worth knowing when you use this: not everything should be a TODO.
+Entries with no todo keyword are plain notes, and standing context ("training
+for a half marathon in March", "Sarah prefers text over calls") is what makes
+this a memory layer instead of a task list.
 
 ## Development
 
