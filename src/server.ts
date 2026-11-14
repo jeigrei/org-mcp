@@ -136,6 +136,14 @@ const dateField = () =>
 const TODO_ENUM = ["TODO", "NEXT", "IN-PROGRESS", "WAITING"] as const;
 const STATE_ENUM = ["TODO", "NEXT", "IN-PROGRESS", "WAITING", "DONE", "CANCELLED"] as const;
 
+const entryFilterSchema = {
+  state: z.enum(STATE_ENUM).optional().describe("Filter to an exact TODO keyword."),
+  tag: z.string().optional().describe("Filter to entries carrying this tag."),
+  priority: z.enum(["A", "B", "C"]).optional().describe("Filter to this priority."),
+  file: z.string().optional().describe('Filter to entries in this org file, e.g. "inbox.org".'),
+  parent_id: z.string().optional().describe("Filter to descendants of the entry with this id."),
+};
+
 function buildServer(store: OrgStore): McpServer {
   const server = new McpServer({ name: "org-mcp", version: "0.2.0" });
 
@@ -220,16 +228,20 @@ function buildServer(store: OrgStore): McpServer {
       title: "List TODO entries",
       description:
         "List open TODO-like entries across all org files (excludes DONE/CANCELLED by default), " +
-        "sorted by priority then due date. Optionally filter by exact state, tag, or priority.",
+        "sorted by priority then due date. Optionally filter by exact state, tag, priority, file, or parent_id (all descendants).",
       inputSchema: {
-        state: z.enum(STATE_ENUM).optional().describe("Filter to an exact TODO keyword."),
-        tag: z.string().optional().describe("Filter to entries carrying this tag."),
-        priority: z.enum(["A", "B", "C"]).optional().describe("Filter to this priority."),
+        ...entryFilterSchema,
       },
     },
     async (args) => {
       try {
-        const items = await store.listTodos(args);
+        const items = await store.listTodos({
+          state: args.state,
+          tag: args.tag,
+          priority: args.priority,
+          file: args.file,
+          parentId: args.parent_id,
+        });
         return ok(items);
       } catch (err) {
         return fail(err);
@@ -241,17 +253,23 @@ function buildServer(store: OrgStore): McpServer {
     "org_search",
     {
       title: "Search entries",
-      description: "Full-text search across headlines, body text, and tags in all org files.",
+      description:
+        "Full-text search across headlines, body text, and tags in all org files. " +
+        "Optionally filter by exact state, tag, priority, file, or parent_id (all descendants).",
       inputSchema: {
         query: z.string().describe("Case-insensitive substring to search for."),
-        tag: z.string().optional().describe("Also require this tag."),
+        ...entryFilterSchema,
         include_archive: z.boolean().optional().describe("Also search archived entries. Default false."),
       },
     },
     async (args) => {
       try {
         const items = await store.search(args.query, {
+          state: args.state,
           tag: args.tag,
+          priority: args.priority,
+          file: args.file,
+          parentId: args.parent_id,
           includeArchive: args.include_archive ?? false,
         });
         return ok(items);
@@ -267,7 +285,7 @@ function buildServer(store: OrgStore): McpServer {
       title: "Get a single entry",
       description: "Fetch full details of one entry by its id, including its body text.",
       inputSchema: {
-        id: z.string().describe("The entry's id (returned by capture/agenda/search/etc.)."),
+        id: z.string().describe("The entry's id (a UUID or a temporary tmp: handle; a tmp: handle is valid only until its file changes — any write to that file, by org-mcp or an editor, makes it stale, so re-read after each write)."),
       },
     },
     async (args) => {
@@ -289,7 +307,7 @@ function buildServer(store: OrgStore): McpServer {
         "Change the TODO keyword of an entry, e.g. mark it DONE, TODO, NEXT, WAITING, or CANCELLED. " +
         "Moving into DONE/CANCELLED stamps a CLOSED timestamp; moving out of one clears it.",
       inputSchema: {
-        id: z.string().describe("The entry's id."),
+        id: z.string().describe("The entry's id (a UUID or a temporary tmp: handle; a tmp: handle is valid only until its file changes — any write to that file, by org-mcp or an editor, makes it stale, so re-read after each write)."),
         state: z.enum(STATE_ENUM).nullable().describe("New TODO keyword, or null to remove the keyword entirely."),
       },
     },
@@ -311,7 +329,7 @@ function buildServer(store: OrgStore): McpServer {
         "Set, change, or clear the SCHEDULED and/or DEADLINE timestamps on an entry. " +
         "Omit a field to leave it unchanged; pass null to clear it.",
       inputSchema: {
-        id: z.string().describe("The entry's id."),
+        id: z.string().describe("The entry's id (a UUID or a temporary tmp: handle; a tmp: handle is valid only until its file changes — any write to that file, by org-mcp or an editor, makes it stale, so re-read after each write)."),
         scheduled: dateField().nullish().describe("New SCHEDULED date/time, or null to clear."),
         deadline: dateField().nullish().describe("New DEADLINE date/time, or null to clear."),
       },
@@ -335,7 +353,7 @@ function buildServer(store: OrgStore): McpServer {
       title: "Add a timestamped note",
       description: "Append a timestamped note/log line to an existing entry's body.",
       inputSchema: {
-        id: z.string().describe("The entry's id."),
+        id: z.string().describe("The entry's id (a UUID or a temporary tmp: handle; a tmp: handle is valid only until its file changes — any write to that file, by org-mcp or an editor, makes it stale, so re-read after each write)."),
         note: z.string().describe("Note text to append."),
       },
     },
@@ -359,7 +377,7 @@ function buildServer(store: OrgStore): McpServer {
         "to move it to the top level of another file. Levels are adjusted automatically, so a " +
         "whole project moves with its tasks intact.",
       inputSchema: {
-        id: z.string().describe("The entry's id."),
+        id: z.string().describe("The entry's id (a UUID or a temporary tmp: handle; a tmp: handle is valid only until its file changes — any write to that file, by org-mcp or an editor, makes it stale, so re-read after each write)."),
         parent_id: z
           .string()
           .nullish()
@@ -393,7 +411,7 @@ function buildServer(store: OrgStore): McpServer {
         "id, so anything referring to it stays valid. Use org_add_note instead to append to a " +
         "body without replacing it, and org_update_state to change TODO state.",
       inputSchema: {
-        id: z.string().describe("The entry's id."),
+        id: z.string().describe("The entry's id (a UUID or a temporary tmp: handle; a tmp: handle is valid only until its file changes — any write to that file, by org-mcp or an editor, makes it stale, so re-read after each write)."),
         headline: z.string().optional().describe("New title text (no stars, state, or tags)."),
         body: z
           .string()
@@ -425,13 +443,42 @@ function buildServer(store: OrgStore): McpServer {
         "Call org_list_tags first and reuse tags that already exist — inventing a near-synonym " +
         "for a tag already in use (:work: vs :job:) quietly breaks tag-filtered searches later.",
       inputSchema: {
-        id: z.string().describe("The entry's id."),
+        id: z.string().describe("The entry's id (a UUID or a temporary tmp: handle; a tmp: handle is valid only until its file changes — any write to that file, by org-mcp or an editor, makes it stale, so re-read after each write)."),
         tags: z.array(z.string()).describe("The complete tag list, without colons."),
       },
     },
     async (args) => {
       try {
         const entry = await store.setTags(args.id, args.tags);
+        return ok(entry);
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "org_set_properties",
+    {
+      title: "Set an entry's properties",
+      description:
+        "Set, update, or remove keys in an entry's :PROPERTIES: drawer. Pass a map of property " +
+        "keys to string values (adds or replaces in place) or null (removes the key). Keys absent " +
+        "from the map are left unchanged. ID and CREATED are managed by the server and cannot be modified.",
+      inputSchema: {
+        id: z.string().describe("The entry's id (a UUID or a temporary tmp: handle; a tmp: handle is valid only until its file changes — any write to that file, by org-mcp or an editor, makes it stale, so re-read after each write)."),
+        properties: z
+          .record(z.string(), z.string().nullable())
+          .describe(
+            "Map of property keys to values: a string sets the value (adding or replacing in place), " +
+              "null removes the key, and omitted keys are left unchanged. Keys must be non-empty with no " +
+              "whitespace or colons; values must be single-line (no newlines). ID and CREATED are refused."
+          ),
+      },
+    },
+    async (args) => {
+      try {
+        const entry = await store.setProperties(args.id, args.properties);
         return ok(entry);
       } catch (err) {
         return fail(err);
@@ -465,7 +512,7 @@ function buildServer(store: OrgStore): McpServer {
         "Move an entry (and its subtree) out of its source file into a companion `<file>_archive.org` file. " +
         "Use this to clean up completed or stale items while keeping a record.",
       inputSchema: {
-        id: z.string().describe("The entry's id."),
+        id: z.string().describe("The entry's id (a UUID or a temporary tmp: handle; a tmp: handle is valid only until its file changes — any write to that file, by org-mcp or an editor, makes it stale, so re-read after each write)."),
       },
     },
     async (args) => {
@@ -512,6 +559,48 @@ function buildServer(store: OrgStore): McpServer {
       try {
         const files = await store.listFiles(args.include_archive ?? false);
         return ok({ directory: store.directory, files });
+      } catch (err) {
+        return fail(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "org_outline",
+    {
+      title: "Get heading outline",
+      description:
+        "Return a hierarchical outline of org headings with TODO state, tags, descendant counts " +
+        "by TODO state, and nested children up to maxDepth. Filter by file, rootId, and/or level " +
+        '(e.g. {file: "inbox.org", level: 1, maxDepth: 1} to list top-level headings with their direct children).',
+      inputSchema: {
+        file: z.string().optional().describe('Limit to a single org file, e.g. "inbox.org".'),
+        rootId: z.string().optional().describe("Start the outline at the entry with this id."),
+        level: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe("Return only headings at this exact star level (e.g. 1 for top-level)."),
+        maxDepth: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Maximum child depth to include below each returned node (0 = no children, 1 = direct children only)."
+          ),
+      },
+    },
+    async (args) => {
+      try {
+        const nodes = await store.outline({
+          file: args.file,
+          rootId: args.rootId,
+          level: args.level,
+          maxDepth: args.maxDepth,
+        });
+        return ok(nodes);
       } catch (err) {
         return fail(err);
       }

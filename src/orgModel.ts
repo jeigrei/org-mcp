@@ -8,8 +8,15 @@ export function isDoneKeyword(kw: string | null): boolean {
   return kw !== null && (DONE_KEYWORDS as readonly string[]).includes(kw);
 }
 
+export interface OrgPathSegment {
+  id: string | null;
+  headline: string;
+}
+
 export interface OrgEntry {
   id: string | null;
+  parentId: string | null;
+  path: OrgPathSegment[];
   file: string; // filename relative to org dir
   level: number;
   todo: string | null;

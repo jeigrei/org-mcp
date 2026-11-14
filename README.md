@@ -25,12 +25,51 @@ Entries are ordinary org headlines:
 Every captured entry gets a stable `:ID:` (a UUID) so it can be looked up,
 rescheduled, or marked done later regardless of edits elsewhere in the file.
 Hand-written entries (e.g. typed directly into the file in Emacs) that lack
-an `:ID:` are lazily assigned one the first time a listing tool (agenda,
-search, list-todos) encounters them — after that they're addressable too.
+an `:ID:` are never modified during reads; instead, read tools return a
+temporary `tmp:<file>:<line>:<hash>` handle. A `tmp:` handle is valid only
+until its file changes: any write to that file, by org-mcp or an external
+editor, makes the handle stale, so re-read after each write. On the first
+write targeting a valid `tmp:` handle, org-mcp materializes a permanent
+`:ID:` and applies the edit (reusing that same handle on subsequent calls
+within the same server process resolves to the materialized `:ID:`).
 
 Repeaters and time ranges in timestamps (`<2026-08-20 Thu +1w>`,
 `<2026-08-20 Thu 10:00-11:00>`) are preserved verbatim across edits — a
 state change or a reschedule of one field never rewrites the other.
+
+### Atomic writes and backups
+
+Every file write resolves symlinks to the real target, writes to a temporary
+file in the real target's directory (`.<filename>.<uuid>.tmp`), preserves the
+existing file's permissions, `fsync`s the file, atomically renames it over the
+live `.org` file, and `fsync`s the directory — so a crash mid-write cannot
+truncate or corrupt it. Note that hard links are split by the rename (use
+symlinks if linking a file into another directory).
+
+Before overwriting an existing `.org` file, the previous version is copied to
+`<filename>.bak` in the same directory as the real file (for example,
+`inbox.org.bak`). This is a rolling one-deep backup of the last version before
+the most recent write; `.bak` and `.tmp` files are ignored by `org_list_files`
+and all other tools.
+
+To restore a file from its `.bak` backup (files live in each user's directory,
+`<ORG_MCP_DIR>/<user>/`; for symlinked files, `.bak` lives next to the real
+file, so `cd` to the real target's directory instead):
+
+1. Stop `org-mcp` (e.g. `pm2 stop org-mcp`) so an in-flight tool call cannot
+   overwrite your restore.
+2. `cd <ORG_MCP_DIR>/<user>` and inspect the backup to confirm it contains the
+   expected state:
+   ```bash
+   diff -u inbox.org.bak inbox.org
+   ```
+3. Copy the current file aside (so a mistaken restore can be undone), copy the
+   backup over the live file, and restart the server:
+   ```bash
+   cp inbox.org inbox.org.before-restore
+   cp inbox.org.bak inbox.org
+   pm2 start org-mcp
+   ```
 
 ## Multi-user isolation
 
@@ -302,15 +341,17 @@ curl -s http://127.0.0.1:3000/mcp \
 |---|---|
 | `org_capture` | Append a new entry (task, note, or event) to a file, org-capture style. Supports `parent_id` to nest under an existing entry. |
 | `org_agenda` | Org-agenda style view: entries scheduled/due in a date range, plus overdue open items. |
-| `org_list_todos` | List open TODO-like entries, sorted by priority/due date, filterable by state/tag/priority. |
-| `org_search` | Full-text search across headlines, body, and tags. |
+| `org_list_todos` | List open TODO-like entries by default (unless `state` is given), sorted by priority/due date; filterable by `state`, `tag`, `priority`, `file` (with or without `.org`), and `parent_id` (descendants). |
+| `org_search` | Full-text search across headlines, body, and tags (no state filter by default); filterable by `state`, `tag`, `priority`, `file` (with or without `.org`), and `parent_id` (descendants), with optional `include_archive` (default `false`). |
 | `org_get_entry` | Fetch one entry's full details by id. |
+| `org_outline` | Return a heading tree with descendant TODO counts, filterable by `file`, `rootId`, `level`, and `maxDepth` (e.g. `{file: "inbox.org", level: 1, maxDepth: 1}` to list projects). |
 | `org_update_state` | Change an entry's TODO keyword (e.g. mark DONE); stamps/clears `CLOSED`. |
 | `org_schedule` | Set/change/clear `SCHEDULED` and/or `DEADLINE`. |
 | `org_add_note` | Append a timestamped note to an entry's body. |
 | `org_refile` | Move an entry and its subtree under another entry or into another file. |
 | `org_edit_entry` | Change an entry's headline, body, or priority. |
 | `org_set_tags` | Replace an entry's tags. |
+| `org_set_properties` | Set, update, or remove keys in an entry's `:PROPERTIES:` drawer (`string` sets, `null` removes, omitted keys are unchanged; `ID` and `CREATED` are refused). |
 | `org_list_tags` | List every tag in use, with counts. |
 | `org_archive_entry` | Move an entry's subtree to `<file>_archive.org`. |
 | `org_read_file` | Read the raw text of one tracked org file. |

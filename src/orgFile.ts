@@ -73,11 +73,18 @@ export function parseOrgFile(content: string, filename: string): ParsedEntry[] {
   }
 
   const entries: ParsedEntry[] = [];
+  const openHeadings: { level: number; id: string | null; headline: string }[] = [];
 
   for (let hi = 0; hi < headlineIdx.length; hi++) {
     const { line: headlineLine, level } = headlineIdx[hi];
     const m = lines[headlineLine].match(HEADLINE_RE)!;
     const { todo, priority, headline, tags } = parseHeadlineText(m[2]);
+
+    while (openHeadings.length > 0 && openHeadings[openHeadings.length - 1].level >= level) {
+      openHeadings.pop();
+    }
+    const parentId = openHeadings.length > 0 ? openHeadings[openHeadings.length - 1].id : null;
+    const path = openHeadings.map(({ id, headline: h }) => ({ id, headline: h }));
 
     // Subtree end: next headline at level <= this level, or EOF.
     let subtreeEnd = lines.length;
@@ -152,8 +159,12 @@ export function parseOrgFile(content: string, filename: string): ParsedEntry[] {
       .replace(/^\n+/, "")
       .replace(/\n+$/, "");
 
+    const id = properties.ID ?? null;
+
     entries.push({
-      id: properties.ID ?? null,
+      id,
+      parentId,
+      path,
       file: filename,
       level,
       todo,
@@ -177,6 +188,8 @@ export function parseOrgFile(content: string, filename: string): ParsedEntry[] {
       deadlineRaw,
       closedRaw,
     });
+
+    openHeadings.push({ level, id, headline });
   }
 
   return entries;
